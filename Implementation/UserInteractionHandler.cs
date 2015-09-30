@@ -198,6 +198,7 @@ namespace Terraria.Plugins.CoderCow.Protector {
             terms.Add("/dumpbankchest");
           if (args.Player.Group.HasPermission(ProtectorPlugin.Utility_Permission)) {
             terms.Add("/lockchest");
+            terms.Add("/protector invalidate");
             if (args.Player.Group.HasPermission(ProtectorPlugin.ProtectionMaster_Permission)) {
               terms.Add("/protector cleanup");
               terms.Add("/protector removeall");
@@ -1852,78 +1853,61 @@ namespace Terraria.Plugins.CoderCow.Protector {
         case TileEditType.TileKill:
         case TileEditType.TileKillNoItem: {
           // Is the tile really going to be destroyed or just being hit?
-          if (blockType != 0)
-            break;
+          //if (blockType != 0)
+          //  break;
 
-          // Because Terraria is dumb-assed, TileKill which is usually only sent on a chest being removed, is also sent
-          // when the chest is filled but was hit enought times to be removed, thus we have to work around this by checking
-          // if there's content in the chest.
-          Tile tile = TerrariaUtils.Tiles[location];
-          if (tile.active() && (tile.type == TileID.Containers || tile.type == TileID.Dressers)) {
-            DPoint chestLocation = TerrariaUtils.Tiles.MeasureObject(location).OriginTileLocation;
-            int chestIndex = Chest.FindChest(chestLocation.X, chestLocation.Y);
-            // Non existing chests are considered empty.
-            if (chestIndex != -1) {
-              Chest tChest = Main.chest[chestIndex];
-              bool isFilled = tChest.item.Any(i => i != null && i.stack > 0);
-              if (isFilled) {
-                lock (this.WorldMetadata.Protections) {
-                  ProtectionEntry protection;
-                  if (
-                    !this.WorldMetadata.Protections.TryGetValue(chestLocation, out protection) ||
-                    protection.BankChestKey == BankChestDataKey.Invalid
-                  ) {
-                    break;
-                  }
-                }
-              }
-            }
-          }
-
-          Tile protectedTile = null;
           foreach (ProtectionEntry protection in this.ProtectionManager.EnumerateProtectionEntries(location)) {
+            // If the protection is invalid, just remove it.
             if (!TerrariaUtils.Tiles.IsValidCoord(protection.TileLocation)) {
               this.ProtectionManager.RemoveProtection(TSPlayer.Server, protection.TileLocation, false);
-              protectedTile = null;
               continue;
             }
-            protectedTile = TerrariaUtils.Tiles[protection.TileLocation];
 
+            Tile protectedTile = TerrariaUtils.Tiles[protection.TileLocation];
             // If the protection is invalid, just remove it.
             if (!protectedTile.active() || protectedTile.type != (int)protection.BlockType) {
               this.ProtectionManager.RemoveProtection(TSPlayer.Server, protection.TileLocation, false);
-              protectedTile = null;
               continue;
             }
 
+            string tileName = TerrariaUtils.Tiles.GetBlockTypeName((BlockType)protectedTile.type);
             if (
               protection.Owner == player.User.ID || (
                 this.Config.AutoDeprotectEverythingOnDestruction &&
                 player.Group.HasPermission(ProtectorPlugin.ProtectionMaster_Permission)
               )
             ) {
-              this.ProtectionManager.RemoveProtection(player, protection.TileLocation, false);
+              bool isChest = (protectedTile.type == TileID.Containers || protectedTile.type == TileID.Dressers);
+              if (isChest) {
+                ObjectMeasureData measureData = TerrariaUtils.Tiles.MeasureObject(protection.TileLocation);
+                DPoint chestLocation = measureData.OriginTileLocation;
+                int chestId = Chest.FindChest(chestLocation.X, chestLocation.Y);
 
-              if (this.Config.NotifyAutoDeprotections) {
-                player.SendWarningMessage(string.Format(
-                  "The {0} is not protected anymore.", TerrariaUtils.Tiles.GetBlockTypeName((BlockType)protectedTile.type)
-                ));
+                if (chestId != -1) {
+                  bool isBankChest = (protection.BankChestKey != BankChestDataKey.Invalid);
+                  if (isBankChest) {
+                    Chest.DestroyChestDirect(chestLocation.X, chestLocation.Y, chestId);
+                    WorldGen.KillTile(location.X, location.Y);
+                    TSPlayer.All.SendData(PacketTypes.TileKill, string.Empty, 3, chestLocation.X, chestLocation.Y, 0f, chestId);
+                  } else {
+                    Chest tChest = Main.chest[chestId];
+                    bool isFilled = tChest.item.Any(i => i != null && i.stack > 0);
+                    if (isFilled)
+                      break; // Do not remove protections of filled chests.
+                  }
+                }
               }
-
-              protectedTile = null;
-              continue;
+              this.ProtectionManager.RemoveProtection(player, protection.TileLocation, false);
+          
+              if (this.Config.NotifyAutoDeprotections)
+                player.SendWarningMessage(string.Format("The {0} is not protected anymore.", tileName));
+            } else {
+              player.SendErrorMessage(string.Format("The {0} is protected.", tileName));
+              player.SendTileSquare(location);
+              return true;
             }
           }
 
-          if (protectedTile != null) {
-            player.SendErrorMessage(string.Format(
-              "The {0} is protected.", TerrariaUtils.Tiles.GetBlockTypeName((BlockType)protectedTile.type)
-            ));
-
-            player.SendTileSquare(location);
-            return true;
-          }
-          
           break;
         }
         case TileEditType.PlaceWire:
@@ -1935,33 +1919,6 @@ namespace Terraria.Plugins.CoderCow.Protector {
             player.SendTileSquare(location);
             return true;
           }
-
-          break;
-        case TileEditType.PlaceTile: // As of Terraria 1.2.3, this packet should never be sent for chests.
-          // Fix: We do not allow chests to be placed on active stone to prevent players from using the chest duplication bugs.
-          // Fix2: Don't allow on ice blocks either, you never know.
-          /*if (blockType == BlockType.Chest) {
-            for (int x = 0; x < 2; x++) {
-              DPoint tileBeneathLocation = location.OffsetEx(x, 1);
-              if (
-                TerrariaUtils.Tiles[tileBeneathLocation].active() && (
-                  TerrariaUtils.Tiles[tileBeneathLocation].type == (int)BlockType.ActiveStone ||
-                  TerrariaUtils.Tiles[tileBeneathLocation].type == (int)BlockType.IceRodBlock
-                )
-              ) {
-                TSPlayer.All.SendData(PacketTypes.Tile, string.Empty, 0, location.X, location.Y);
-
-                bool dummy;
-                ChestStyle chestStyle = TerrariaUtils.Tiles.GetChestStyle(objectStyle, out dummy);
-                int itemType = (int)TerrariaUtils.Tiles.GetItemTypeFromChestType(chestStyle);
-                Item.NewItem(location.X * TerrariaUtils.TileSize, location.Y * TerrariaUtils.TileSize, 32, 32, itemType);
-
-                player.SendErrorMessage("Chests can not be placed on active stone or ice blocks.");
-
-                return true;
-              }
-            }
-          }*/
 
           break;
       }
@@ -2067,7 +2024,7 @@ namespace Terraria.Plugins.CoderCow.Protector {
       return false;
     }
 
-    // Note: chestLocation is always {0, 0}. chestIndex == -1 chest, piggy, safe closed. chestIndex == -2 if piggy bank, chestIndex == -3 safe is is opened.
+    // Note: chestLocation is always {0, 0}. chestIndex == -1 chest, piggy, safe closed. chestIndex == -2 if piggy bank, chestIndex == -3 safe is opened.
     public virtual bool HandleChestOpen(TSPlayer player, int chestIndex, DPoint chestLocation) {
       if (this.IsDisposed)
         return false;
@@ -2129,6 +2086,14 @@ namespace Terraria.Plugins.CoderCow.Protector {
       if (this.Config.LoginRequiredForChestUsage && !player.IsLoggedIn) {
         player.SendErrorMessage("You have to be logged in to make use of chests.");
         return true;
+      }
+
+      if (this.Config.DungeonChestProtection && !NPC.downedBoss3 && !player.Group.HasPermission(ProtectorPlugin.ProtectionMaster_Permission)) {
+        ChestKind kind = TerrariaUtils.Tiles.GuessChestKind(location);
+        if (kind == ChestKind.DungeonChest || kind == ChestKind.HardmodeDungeonChest) {
+          player.SendErrorMessage("Skeletron has not been defeated yet.");
+          return true;
+        }
       }
       
       ProtectionEntry protection = null;
@@ -2267,7 +2232,7 @@ namespace Terraria.Plugins.CoderCow.Protector {
     public virtual bool HandleChestUnlock(TSPlayer player, DPoint chestLocation) {
       if (this.IsDisposed)
         return false;
-      
+ 
       ProtectionEntry protection = null;
       // Only need the first enumerated entry as we don't need the protections of adjacent blocks.
       foreach (ProtectionEntry enumProtection in this.ProtectionManager.EnumerateProtectionEntries(chestLocation)) {
